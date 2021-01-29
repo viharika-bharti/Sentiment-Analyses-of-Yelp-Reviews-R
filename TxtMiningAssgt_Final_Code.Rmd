@@ -1,0 +1,1051 @@
+---
+title: "txtMiningAssgt_gettingStarted"
+author: "Viharika"
+date: "4/17/2020"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+#Read the data
+resReviewsData <- read.csv2("C:/Users/vbhar/Desktop/Data Mining/Assignmnet 4- Text Mining/yelpResReviewSample.csv")
+# the data file uses ';' as delimiter, and for this we use the read_csv2 function
+
+library('tidyverse')
+library(tidytext)
+library(SnowballC)
+library(textstem)
+library(dplyr)
+library(ranger)
+library(textdata)
+library(rsample)
+library(pROC)
+library(e1071)
+library(ROCR)
+
+```
+
+#Question 1 - Data exploration
+
+```{r results=FALSE, cache=TRUE}
+
+#number of reviews by start-rating
+Star_count<- resReviewsData %>% group_by(stars) %>% count()
+Star_count
+
+#histogram
+ggplot(Star_count, aes(stars, n, fill = stars)) + geom_bar(stat = "identity") + ggtitle("Star rating distribution") 
+
+#Assigning a sentiment label to the star rating:
+Stars_count1 <- resReviewsData %>% select(review_id, stars)%>% mutate(Sentiment=ifelse(stars<=3, "Negative", "Positive"))
+Stars_count1
+Stars_count1<-Stars_count1 %>% group_by(Sentiment) %>% count()
+
+#Histogram of sentiment 
+ggplot(Stars_count1, aes(Sentiment, n, fill = Sentiment)) + geom_bar(stat = "identity") + ggtitle("Star rating distribution") 
+
+#Do star ratings have any relation to ‘funny’, ‘cool’, ‘useful’? (Is this what you expected?) 
+ggplot(resReviewsData, aes(x= funny, y=stars)) +geom_point() #Category 4 -> have been seen as funny.
+ggplot(resReviewsData, aes(x= cool, y=stars)) +geom_point()
+ggplot(resReviewsData, aes(x= useful, y=stars)) +geom_point()
+
+#Additional data exploration
+#Checking reveiws from various locations
+x<-resReviewsData %>%   group_by(state) %>% tally() %>% view()
+
+#Veiw top 10 states for reveiws
+x %>%  # desc orders from largest to smallest
+arrange(desc(n))
+
+#Can also check the postal-codes`
+#If you want to keep only the those reviews from 5-digit postal-codes  
+rrData <- resReviewsData %>% filter(str_detect(postal_code, "^[0-9]{1,5}"))
+
+x1<-rrData %>%   group_by(postal_code) %>% tally() %>% view()
+x1 %>% arrange(desc(n))
+
+
+```
+
+#Question 2- Data cleansing.
+
+Use tidytext for tokenization, removing stopworks, stemming/lemmatization, etc.
+```{r message=FALSE , cache=TRUE}
+
+#str(rrData$text)
+rrData$text<-as.character(rrData$text)
+
+#tokenize the text of the reviews in the column named 'text'
+rrTokens <- rrData %>% unnest_tokens(word, text)
+
+#selecting just the review_id, stars and the text column
+rrTokens <- rrData %>% select(review_id, stars, text ) %>% unnest_tokens(word, text)
+
+#Checking number of tokens(total count of unique words)
+rrTokens %>% distinct(word) %>% dim()
+
+#remove stopwords
+rrTokens <- rrTokens %>% anti_join(stop_words)
+
+#Checking number of tokens(total count of unique words) after removing stop words
+rrTokens %>% distinct(word) %>% dim()
+
+#count the total occurrences of differet words, & sort by most frequent
+rrTokens %>% count(word, sort=TRUE) %>% top_n(10)
+
+#words which are not present in at least 10 reviews
+rareWords <-rrTokens %>% count(word, sort=TRUE) %>% filter(n<10)
+#Removing these rare words
+rare_rmv<-anti_join(rrTokens, rareWords)
+
+#check the words after rare words removed .... 
+rare_rmv %>% count(word, sort=TRUE) %>% view()
+
+#Among the least frequently occurring words are those starting with or including numbers (as in 6oz, 1.15,...).Removing these
+xx<- rare_rmv %>% filter(str_detect(word,"[0-9]")==FALSE)
+
+#checking count after removing
+xx %>% count(word, sort=TRUE) %>% view()
+xx %>% distinct(word) %>% dim()
+
+# cleansed dataset.
+rrTokens<- xx
+```
+
+#Analyze words by star ratings 
+```{r  message=FALSE , cache=TRUE}
+
+#Sorting words by star ratings and the count occurance of these words in each star ratings
+rrTokens %>% group_by(stars) %>% count(word, sort=TRUE) %>% arrange(desc(stars)) %>% view()
+
+# food, service, chicken, pizza => are present in both high and low star ratings=> these should be removed and cant be used in the model
+
+#proportion of word occurrence by star ratings
+ws <- rrTokens %>% group_by(stars) %>% count(word, sort=TRUE)
+ws<-  ws %>% group_by(stars) %>% mutate(prop=n/sum(n))
+
+#check the proportion of 'love' among reviews with 1,2,..5 stars 
+ws %>% filter(word=='love')
+
+#what are the most commonly used words by star rating
+ws %>% group_by(stars) %>% arrange(stars, desc(prop)) %>% view()
+
+#to see the top 20 words by star ratings
+ws %>% group_by(stars) %>% arrange(stars, desc(prop)) %>% filter(row_number()<=20L) %>% view()
+
+#To plot this
+ws %>% group_by(stars) %>% arrange(stars, desc(prop)) %>% filter(row_number()<=20L) %>% ggplot(aes(word, prop))+geom_col()+coord_flip()+facet_wrap((~stars))
+
+#Or, separate plots by stars
+ws %>% filter(stars==1)  %>%  ggplot(aes(word, n)) + geom_col()+coord_flip()
+
+#Can we get a sense of which words are related to higher/lower star raings in general? 
+#One approach is to calculate the average star rating associated with each word - can sum the star ratings associated with reviews where each word occurs in.  Can consider the proportion of each word among reviews with a star rating.
+xx<- ws %>% group_by(word) %>% summarise(totWS=sum(stars*prop))
+
+#What are the 20 words with highest and lowerst star rating
+xx %>% top_n(20)
+xx %>% top_n(-20)
+   #Q - does this 'make sense'?
+
+```
+
+
+#Stemming and Lemmatization
+```{r , cache=TRUE}
+#rrTokens_stem<-rrTokens %>%  mutate(word_stem = SnowballC::wordStem(word))
+rrTokens_lemm<-rrTokens %>%  mutate(word_lemma = textstem::lemmatize_words(word))
+   #Check the original words, and their stemmed-words and word-lemmas
+
+```
+
+
+#Furthur data cleansing and calculating Term-frequency, tf-idf
+```{r  message=FALSE , cache=TRUE}
+
+#tokenize, remove stopwords, and lemmatize (or you can use stemmed words instead of lemmatization)
+rrTokens<-rrTokens %>%  mutate(word = textstem::lemmatize_words(word))
+
+#Or, to you can tokenize, remove stopwords, lemmatize  as
+#rrTokens <- resReviewsData %>% select(review_id, stars, text, ) %>% unnest_tokens(word, text) %>%  anti_join(stop_words) %>% mutate(word = textstem::lemmatize_words(word))
+ 
+
+#We may want to filter out words with less than 3 characters and those with more than 15 characters
+#Change from OR to AND here
+rrTokens<-rrTokens %>% filter(str_length(word)<=3 | str_length(word)<=15)
+
+rrTokens<- rrTokens %>% group_by(review_id, stars) %>% count(word)
+
+#count total number of words by review, and add this in a column
+totWords<-rrTokens  %>% group_by(review_id) %>%  count(word, sort=TRUE) %>% summarise(total=sum(n))
+xx<-left_join(rrTokens, totWords)  
+
+# now n/total gives the tf values
+xx<-xx %>% mutate(tf=n/total)
+head(xx)
+
+#We can use the bind_tfidf function to calculate the tf, idf and tfidf values
+# (https://www.rdocumentation.org/packages/tidytext/versions/0.2.2/topics/bind_tf_idf)
+rrTokens<-rrTokens %>% bind_tf_idf(word, review_id, n)
+head(rrTokens)
+
+#Summary
+summary(rrTokens$tf_idf)
+```
+#Question 3
+
+#Sentiment analysis using the 3 sentiment dictionaries available with tidytext (use library(textdata))
+AFINN http://www2.imm.dtu.dk/pubdb/views/publication_details.php?id=6010
+bing  https://www.cs.uic.edu/~liub/FBS/sentiment-analysis.html 
+nrc http://saifmohammad.com/WebPages/NRC-Emotion-Lexicon.htm
+
+```{r message=FALSE , cache=TRUE}
+
+
+
+#take a look at the wordsin the sentimennt dictionaries
+get_sentiments("bing") %>% view()
+get_sentiments("nrc") %>% view()
+get_sentiments("afinn") %>% view()
+
+#sentiment of words in rrTokens as per Bing Liu dictionary
+rrSenti_bing<- rrTokens %>% left_join(get_sentiments("bing"), by="word")
+
+#if we want to retain only the words which match the sentiment dictionary, do an inner-join
+rrSenti_bing<- rrTokens %>% inner_join(get_sentiments("bing"), by="word")
+
+#Analyze Which words contribute to positive/negative sentiment
+
+#Count the occurance of each word along with pos/neg sentiment
+xx<-rrSenti_bing %>% group_by(word, sentiment) %>% summarise(totOcc=sum(n)) %>% arrange(sentiment, desc(totOcc))
+
+#negate the counts for the negative sentiment words (basically adding a negative sign)
+xx<- xx %>% mutate (totOcc=ifelse(sentiment=="positive", totOcc, -totOcc))
+
+#the most positive and most negative words
+xx<-ungroup(xx)
+xx %>% top_n(25)
+xx %>% top_n(-25)
+
+#You can plot these
+rbind(top_n(xx, 25), top_n(xx, -25)) %>% ggplot(aes(word, totOcc, fill=sentiment)) +geom_col()+coord_flip()
+
+#or, with a better reordering of words
+rbind(top_n(xx, 25), top_n(xx, -25)) %>% mutate(word=reorder(word,totOcc)) %>% ggplot(aes(word, totOcc, fill=sentiment)) +geom_col()+coord_flip()
+
+#Q - does this 'make sense'?  Do the different dictionaries give similar results; do you notice much difference?
+
+
+#with "nrc" dictionary
+
+#Assign sentiments as per NRC dictionary
+rrSenti_nrc<- rrTokens %>% left_join(get_sentiments("nrc"), by="word")
+
+#remove NAs
+rrSenti_nrc<- rrTokens %>% inner_join(get_sentiments("nrc"), by="word")
+
+# to check counts of each sentiment and emotion
+xx<-rrSenti_nrc %>% group_by(word, sentiment) %>% summarise(totOcc=sum(n)) %>% arrange(sentiment, desc(totOcc))
+
+#Remove NAs
+rrSenti_nrc<-rrTokens %>% inner_join(get_sentiments("nrc"), by="word") %>% group_by (word, sentiment) %>% summarise(totOcc=sum(n)) %>% arrange(sentiment, desc(totOcc))
+
+#How many words for the different sentiment categories
+rrSenti_nrc %>% group_by(sentiment) %>% summarise(count=n(), sumn=sum(totOcc))
+
+#In 'nrc', the dictionary contains words defining different sentiments, like anger, disgust, positive, negative, joy, trust,.....   you should check the words deonting these different sentiments
+x<-rrSenti_nrc %>% filter(sentiment=='anticipation') %>% view()
+rrSenti_nrc %>% filter(sentiment=='fear') %>% view()
+rrSenti_nrc %>% filter(sentiment=='anger') %>% view()
+rrSenti_nrc %>% filter(sentiment=='disgust') %>% view()
+rrSenti_nrc %>% filter(sentiment=='joy') %>% view()
+rrSenti_nrc %>% filter(sentiment=='negative') %>% view()
+rrSenti_nrc %>% filter(sentiment=='positive') %>% view()
+rrSenti_nrc %>% filter(sentiment=='surprise') %>% view()
+rrSenti_nrc %>% filter(sentiment=='trust') %>% view()
+#...
+
+#Suppose you want   to consider  {anger, disgust, fear sadness, negative} to denote 'bad' reviews, and {positive, joy, anticipation, trust} to denote 'good' reviews
+xx<-rrSenti_nrc %>% mutate(goodBad=ifelse(sentiment %in% c('anger', 'disgust', 'fear', 'sadness', 'negative'), -totOcc, ifelse(sentiment %in% c('positive', 'joy', 'anticipation', 'trust'), totOcc, 0)))
+
+xx<-ungroup(xx)
+top_n(xx, 25)
+top_n(xx, -25)
+
+rbind(top_n(xx, 25), top_n(xx,-25)) %>% mutate(word=reorder(word,goodBad)) %>% ggplot(aes(word, goodBad, fill=goodBad)) +geom_col()+coord_flip()
+
+rbind(top_n(xx, 25), top_n(xx, -25)) %>% mutate(word=reorder(word,totOcc)) %>% ggplot(aes(word, totOcc, fill=goodBad)) +geom_col()+coord_flip()
+
+
+#with AFINN dictionary
+rrSenti_afinn<- rrTokens %>% left_join(get_sentiments("afinn"), by="word")
+
+# to check counts of each sentiment value
+xx<-rrSenti_afinn %>% group_by(word, value) %>% summarise(totOcc=sum(n)) %>% arrange(value, desc(totOcc))
+
+#Removing NAs
+rrSenti_afinn<- rrTokens %>% inner_join(get_sentiments("afinn"), by="word")
+
+rr_afinn <- rrSenti_afinn %>% group_by(word, value) %>% summarise(nwords=n(), sentiSum =sum(value))
+
+rr_afinn<-ungroup(rr_afinn)
+top_n(rr_afinn, 25)
+top_n(rr_afinn, -25)
+
+rbind(top_n(rr_afinn, 25), top_n(rr_afinn, -25)) %>% mutate(word=reorder(word,sentiSum)) %>% ggplot(aes(word, sentiSum, fill=sentiSum)) +geom_col()+coord_flip()
+
+
+```
+
+#Question c
+#Analysis by review sentiment
+So far, we have analyzed overall sentiment across reviews, now let's look into sentiment by review and see how that relates to review's star ratings
+```{r message=FALSE , cache=TRUE}
+
+#1)Bing Liu Dictionary 
+#summarise positive/negative sentiment words per review
+revSenti_bing <- rrSenti_bing %>% group_by(review_id, stars) %>% summarise(nwords=n(),posSum=sum(sentiment=='positive'), negSum=sum(sentiment=='negative'))
+
+revSenti_bing<- revSenti_bing %>% mutate(posProp=posSum/nwords, negProp=negSum/nwords)
+revSenti_bing<- revSenti_bing %>% mutate(sentiScore=posProp-negProp)
+
+#Do review start ratings correspond to the the positive/negative sentiment words
+revSenti_bing %>% group_by(stars) %>% summarise(avgPos=mean(posProp), avgNeg=mean(negProp), avgSentiSc=mean(sentiScore))
+
+#2) NRC Dictionary
+
+#Using NRC dictionary
+rrSenti_nrc<- rrTokens %>% inner_join(get_sentiments("nrc"), by="word")
+
+#mapping the 8 emotions and 2 sentiments from NRC dictionary to either "positiev" or "negative"
+revSenti_nrc <- rrSenti_nrc %>% mutate(sentiment=recode(sentiment, `joy`="positive", `anticipation`="positive",`trust`="positive", `anger`="negative",`disgust`="negative", `fear`="negative",`sadness`="negative",`surprise`="positive" ))
+
+# count after mapping
+revSenti_nrc  %>% group_by(sentiment) %>% count()
+
+#summarise positive/negative sentiment words per review
+revSenti_nrc <- revSenti_nrc %>% group_by(review_id, stars) %>% summarise(nwords=n(),posSum=sum(sentiment=='positive'), negSum=sum(sentiment=='negative'))
+
+revSenti_nrc<- revSenti_nrc %>% mutate(posProp=posSum/nwords, negProp=negSum/nwords)
+revSenti_nrc<- revSenti_nrc %>% mutate(sentiScore=posProp-negProp)
+
+#Do review start ratings correspond to the the positive/negative sentiment words
+revSenti_nrc %>% group_by(stars) %>% summarise(avgPos=mean(posProp), avgNeg=mean(negProp), avgSentiSc=mean(sentiScore))
+
+##2) AFINN Dictionary
+#with AFINN dictionary words....following similar steps as above, but noting that AFINN assigns negative to positive sentiment value for words matching the dictionary
+rrSenti_afinn<- rrTokens %>% inner_join(get_sentiments("afinn"), by="word")
+
+revSenti_afinn <- rrSenti_afinn %>% group_by(review_id, stars) %>% summarise(nwords=n(), sentiScore =sum(value))
+
+revSenti_afinn %>% group_by(stars) %>% summarise(avgLen=mean(nwords), avgSenti=mean(sentiScore))
+
+```
+
+#Question c
+#To Predict Review Sentiments Based on the Calculated Aggregate Scores:
+```{r message=FALSE , cache=TRUE}
+
+#1)Bing Dictionary
+
+#Actual Classification based on star rating
+revSenti_bing <- revSenti_bing %>% mutate(hiLo=ifelse(stars<=2,-1, ifelse(stars>=4, 1, 0 )))
+
+#Predicted Classification based on SentiScore
+revSenti_bing <- revSenti_bing %>% mutate(pred_hiLo=ifelse(sentiScore >0, 1, -1)) 
+
+#filter out the reviews with 3 stars, and get the confusion matrix for hiLo vs pred_hiLo
+xx2<-revSenti_bing %>% filter(hiLo!=0)
+
+#COnfusion Matrix
+table(actual=xx2$hiLo, predicted=xx2$pred_hiLo )
+
+#2) NRC Dictionary
+
+##Actual Classification based on star rating
+revSenti_nrc <- revSenti_nrc %>% mutate(hiLo=ifelse(stars<=2,-1, ifelse(stars>=4, 1, 0 )))
+
+#Predicted Classification based on SentiScore
+revSenti_nrc <- revSenti_nrc %>% mutate(pred_hiLo=ifelse(sentiScore >0, 1, -1)) 
+
+#filter out the reviews with 3 stars, and get the confusion matrix for hiLo vs pred_hiLo
+xx1<-revSenti_nrc %>% filter(hiLo!=0)
+
+#COnfusion Matrix
+table(actual=xx1$hiLo, predicted=xx1$pred_hiLo )
+
+#3) AFINN Dictionary
+
+##Actual Classification based on star rating
+revSenti_afinn <- revSenti_afinn %>% mutate(hiLo=ifelse(stars<=2,-1, ifelse(stars>=4, 1, 0 )))
+
+##Predicted Classification based on SentiScore
+revSenti_afinn <- revSenti_afinn %>% mutate(pred_hiLo=ifelse(sentiScore >0, 1, -1)) 
+
+#filter out the reviews with 3 stars, and get the confusion matrix for hiLo vs pred_hiLo
+xx<-revSenti_afinn %>% filter(hiLo!=0)
+
+##COnfusion Matrix
+table(actual=xx$hiLo, predicted=xx$pred_hiLo )
+```
+
+#Question 4
+#1) Random Forest for Bing Dictionary
+
+
+Can we learn a model to predict hiLo ratings, from words in reviews
+```{r message=FALSE, cache=TRUE}
+#considering only those words which match a sentiment dictionary (for eg.  bing)
+
+#use pivot_wider to convert to a dtm form where each row is for a review and columns correspond to words   (https://tidyr.tidyverse.org/reference/pivot_wider.html)
+#revDTM_sentiBing <- rrSenti_bing %>%  pivot_wider(id_cols = review_id, names_from = word, values_from = tf_idf)
+
+#Or, since we want to keep the stars column
+revDTM_sentiBing <- rrSenti_bing %>%  pivot_wider(id_cols = c(review_id,stars), names_from = word, values_from = tf_idf)  %>% ungroup()
+    #Note the ungroup() at the end -- this is IMPORTANT;  we have grouped based on (review_id, stars), and this grouping is retained by default, and can cause problems in the later steps
+
+#filter out the reviews with stars=3, and calculate hiLo sentiment 'class' based on star-rating
+revDTM_sentiBing <- revDTM_sentiBing %>% filter(stars!=3) %>% mutate(hiLo=ifelse(stars<=2, -1, 1)) %>% select(-stars)
+
+#how many review with 1, -1  'class'
+revDTM_sentiBing %>% group_by(hiLo) %>% tally()
+
+#develop a random forest model to predict hiLo from the words in the reviews
+
+#replace all the NAs with 0
+revDTM_sentiBing<-revDTM_sentiBing %>% replace(., is.na(.), 0)
+
+revDTM_sentiBing$hiLo<- as.factor(revDTM_sentiBing$hiLo)
+
+
+revDTM_sentiBing_split<- initial_split(revDTM_sentiBing, 0.5)
+revDTM_sentiBing_trn<- training(revDTM_sentiBing_split)
+revDTM_sentiBing_tst<- testing(revDTM_sentiBing_split)
+
+revDTM_sentiBing_trn %>% group_by(hiLo) %>% tally()
+
+rfModel1<-ranger(dependent.variable.name = "hiLo", data=revDTM_sentiBing_trn %>% select(-review_id), num.trees = 500, importance='permutation', probability = TRUE)
+
+rfModel1
+
+#which variables are important
+importance(rfModel1) %>% view()
+
+#Obtain predictions, and calculate performance
+revSentiBing_predTrn<- predict(rfModel1, revDTM_sentiBing_trn %>% select(-review_id))$predictions
+revSentiBing_predTst<- predict(rfModel1, revDTM_sentiBing_tst %>% select(-review_id))$predictions
+
+#Obtain predictions, and calculate performance
+revSentiBing_predTrn<- predict(rfModel1, revDTM_sentiBing_trn %>% select(-review_id))$predictions
+revSentiBing_predTrn1<-revSentiBing_predTrn[,2]
+revSentiBing_predTrn2 <- ifelse(revSentiBing_predTrn1>0.5,1,-1)
+mean(revSentiBing_predTrn2 == revDTM_sentiBing_trn$hiLo)
+#accuracy 0.91
+
+revSentiBing_predTst<- predict(rfModel1, revDTM_sentiBing_tst %>% select(-review_id))$predictions
+revSentiBing_predTst1<-revSentiBing_predTst[,2]
+revSentiBing_predTst2 <- ifelse(revSentiBing_predTst1>0.3,1,-1)
+mean(revSentiBing_predTst2 == revDTM_sentiBing_tst$hiLo)
+#accuracy 0.85
+
+#confusionmatrix
+table(actual=revDTM_sentiBing_trn$hiLo, preds=revSentiBing_predTrn[,2]>0.3)
+table(actual=revDTM_sentiBing_tst$hiLo, preds=revSentiBing_predTst[,2]>0.3)
+
+rocTrn <- roc(revDTM_sentiBing_trn$hiLo, revSentiBing_predTrn[,2], levels=c(-1, 1))
+rocTst <- roc(revDTM_sentiBing_tst$hiLo, revSentiBing_predTst[,2], levels=c(-1, 1))
+
+plot.roc(rocTrn, col='blue', legacy.axes = TRUE)
+plot.roc(rocTst, col='red', add=TRUE)
+legend("bottomright", legend=c("Training", "Test"),
+        col=c("blue", "red"), lwd=2, cex=0.8, bty='n')
+
+#AUC
+auc(as.numeric(revDTM_sentiBing_trn$hiLo), revSentiBing_predTrn[,2])
+auc(as.numeric(revDTM_sentiBing_tst$hiLo), revSentiBing_predTst[,2])
+ 
+
+#Best threshold from ROC analyses
+bThr<-coords(rocTrn, "best", ret="threshold", transpose = FALSE)
+table(actual=revDTM_sentiBing_trn$hiLo, preds=revSentiBing_predTrn[,2]>bThr)
+
+```
+
+##develop a naive-Bayes model - Bing Liu dictionary
+
+#https://www.rdocumentation.org/packages/e1071/versions/1.7-2/topics/naiveBayes
+```{r message=FALSE, cache=TRUE}
+
+nbModel1<-naiveBayes(hiLo ~ ., data=revDTM_sentiBing_trn %>% select(-review_id))
+
+nbModel1
+
+revSentiBing_NBpredTrn<-predict(nbModel1, revDTM_sentiBing_trn, type = "raw")
+revSentiBing_NBpredTst<-predict(nbModel1, revDTM_sentiBing_tst, type = "raw")
+
+table(actual=revDTM_sentiBing_trn$hiLo, preds=revSentiBing_NBpredTrn[,2]>0.5)
+table(actual=revDTM_sentiBing_tst$hiLo, preds=revSentiBing_NBpredTst[,2]>0.5)
+
+#train accuracy
+revSentiBing_NBpredTrn1<-revSentiBing_NBpredTrn[,2]
+revSentiBing_NBpredTrn2 <- ifelse(revSentiBing_NBpredTrn1>0.5,1,-1)
+mean(revSentiBing_NBpredTrn2 == revDTM_sentiBing_trn$hiLo)
+
+#testing accuracy
+revSentiBing_NBpredTst1<-revSentiBing_NBpredTst[,2]
+revSentiBing_NBpredTst2 <- ifelse(revSentiBing_NBpredTst1>0.5,1,-1)
+mean(revSentiBing_NBpredTst2 == revDTM_sentiBing_tst$hiLo)
+
+
+pred_rf_nb=prediction(as.numeric(revSentiBing_NBpredTst[,2]),as.numeric(revDTM_sentiBing_tst$hiLo))
+aucPerf_nb <-performance(pred_rf_nb, "tpr", "fpr")
+plot(aucPerf_nb) + abline(a=0, b= 1)
+
+auc(as.numeric(revDTM_sentiBing_trn$hiLo), revSentiBing_NBpredTrn[,2])
+auc(as.numeric(revDTM_sentiBing_tst$hiLo), revSentiBing_NBpredTst[,2])
+
+```
+
+#SVM Model - Bing Liu dictionary
+
+```{r}
+
+svmM1 <- svm(as.factor(hiLo) ~., data = revDTM_sentiBing_trn %>%select(-review_id),kernel="radial", scale=FALSE) 
+
+#predicting values
+revDTM_predTrn_svm1<-predict(svmM1, revDTM_sentiBing_trn)
+revDTM_predTst_svm1<-predict(svmM1, revDTM_sentiBing_tst)
+
+table(actual= revDTM_sentiBing_trn$hiLo, predicted= revDTM_predTrn_svm1)
+table(actual= revDTM_sentiBing_tst$hiLo, predicted= revDTM_predTst_svm1)
+
+#accuracy
+mean(revDTM_predTrn_svm1 == revDTM_sentiBing_trn$hiLo)
+#accuracy test
+mean(revDTM_predTst_svm1 == revDTM_sentiBing_tst$hiLo)
+
+
+
+```
+
+
+#NRC dictionary- random forest
+
+```{r}
+
+#to remove duplicated rows
+rrSenti_nrc1 <- rrSenti_nrc[,-8]
+rrSenti_nrc1<-rrSenti_nrc1[!duplicated(rrSenti_nrc1), ]
+
+revDTM_senti_nrc <- rrSenti_nrc1 %>%  pivot_wider(id_cols = c(review_id,stars), names_from = word, values_from = tf_idf)  %>% ungroup()
+
+#filter out the reviews with stars=3, and calculate hiLo sentiment 'class'
+revDTM_senti_nrc<- revDTM_senti_nrc %>% filter(stars!=3) %>% mutate(hiLo=ifelse(stars<=2, -1, 1)) %>% select(-stars)
+
+#how many review with 1, -1  'class'
+revDTM_senti_nrc %>% group_by(hiLo) %>% tally()
+
+#replace all the NAs with 0
+revDTM_senti_nrc<-revDTM_senti_nrc %>% replace(., is.na(.), 0)
+
+#split data into 50:50 ratios
+revDTM_senti_nrc_split<- initial_split(revDTM_senti_nrc, 0.5)
+revDTM_senti_nrc_trn<- training(revDTM_senti_nrc_split)
+revDTM_senti_nrc_tst<- testing(revDTM_senti_nrc_split)
+
+rfModel_nrc<-ranger(dependent.variable.name = "hiLo", data=revDTM_senti_nrc_trn %>% select(-review_id), num.trees = 500, importance='permutation', probability = TRUE)
+
+rfModel_nrc
+
+#Obtain predictions, and calculate performance - training accuracy
+revSentiNrc_predTrn<- predict(rfModel_nrc, revDTM_senti_nrc_trn %>% select(-review_id))$predictions
+revSentiNrc_predTrn1<-revSentiNrc_predTrn[,2]
+revSentiNrc_predTrn2 <- ifelse(revSentiNrc_predTrn1>0.5,1,-1)
+mean(revSentiNrc_predTrn2 == revDTM_senti_nrc_trn$hiLo)
+
+#prediction on test- test accuracy
+revSentiNrc_predTst<- predict(rfModel_nrc, revDTM_senti_nrc_tst %>% select(-review_id))$predictions
+revSentiNrc_predTst1<-revSentiNrc_predTst[,2]
+revSentiNrc_predTst2 <- ifelse(revSentiNrc_predTst1>0.5,1,-1)
+mean(revSentiNrc_predTst2 == revDTM_senti_nrc_tst$hiLo)
+
+#confusion Matrix
+table(actual=revDTM_senti_nrc_trn$hiLo, preds=revSentiNrc_predTrn[,2]>0.5)
+table(actual=revDTM_senti_nrc_tst$hiLo, preds=revSentiNrc_predTst[,2]>0.3)
+
+
+rocTrn <- roc(revDTM_senti_nrc_trn$hiLo, revSentiNrc_predTrn[,2], levels=c(-1, 1))
+rocTst <- roc(revDTM_senti_nrc_tst$hiLo, revSentiNrc_predTst[,2], levels=c(-1, 1))
+
+plot.roc(rocTrn, col='blue', legacy.axes = TRUE)
+plot.roc(rocTst, col='red', add=TRUE)
+legend("bottomright", legend=c("Training", "Test"),
+        col=c("blue", "red"), lwd=2, cex=0.8, bty='n')
+
+#AUC
+auc(as.numeric(revDTM_senti_nrc_trn$hiLo), revSentiNrc_predTrn[,2])
+auc(as.numeric(revDTM_senti_nrc_tst$hiLo), revSentiNrc_predTst[,2])
+
+
+#auc train
+auc(as.numeric(revDTM_senti_nrc_trn$hiLo), revSentiNrc_NBpredTrn[,2])
+auc(as.numeric(revDTM_sentiBing_tst$hiLo), revSentiBing_NBpredTst[,2])
+
+auc(as.numeric(revDTM_senti_nrc_trn$hiLo), revSentiNrc_predTrn[,2])
+#0.99
+#auc test
+auc(as.numeric(revDTM_senti_nrc_tst$hiLo), revSentiNrc_predTst[,2])
+#0.90
+
+
+pred_rf_roc_nrc=prediction(as.numeric(revSentiNrc_predTst[,2]),as.numeric(revDTM_senti_nrc_tst$hiLo))
+aucPerf_rf1_nrc <-performance(pred_rf_roc_nrc, "tpr", "fpr")
+plot(aucPerf_rf1_nrc) + abline(a=0, b= 1)
+
+
+```
+#Naive Bayes - NRC dictionary
+
+```{r}
+
+
+nbModel1_nrc<-naiveBayes(hiLo ~ ., data=revDTM_senti_nrc_trn %>% select(-review_id))
+
+#prediction on train
+revSentiNrc_NBpredTrn<-predict(nbModel1_nrc, revDTM_senti_nrc_trn, type = "raw")
+revSentiNrc_NBpredTrn1<-revSentiNrc_NBpredTrn[,2]
+revSentiNrc_NBpredTrn2 <- ifelse(revSentiNrc_NBpredTrn1>0.5,1,-1)
+mean(revSentiNrc_NBpredTrn2 == revDTM_senti_nrc_trn$hiLo)
+
+#test Accuracy
+revSentiNrc_NBpredTst<-predict(nbModel1_nrc, revDTM_senti_nrc_tst, type = "raw")
+revSentiNrc_NBpredTst1<-revSentiNrc_NBpredTst[,2]
+revSentiNrc_NBpredTst2 <- ifelse(revSentiNrc_NBpredTst1>0.5,1,-1)
+mean(revSentiNrc_NBpredTst2 == revDTM_senti_nrc_tst$hiLo)
+
+#Auc
+auc(as.numeric(revDTM_senti_nrc_trn$hiLo), revSentiNrc_NBpredTrn[,2])
+auc(as.numeric(revDTM_senti_nrc_tst$hiLo), revSentiNrc_NBpredTst[,2])
+
+#confusion matrix
+table(actual=revDTM_senti_nrc_trn$hiLo, preds=revSentiNrc_NBpredTrn[,2]>0.5)
+table(actual=revDTM_senti_nrc_tst$hiLo, preds=revSentiNrc_NBpredTst[,2]>0.5)
+
+#ROC
+pred_nrc_nb2=prediction(as.numeric(revSentiNrc_NBpredTst[,2]),as.numeric(revDTM_senti_nrc_tst$hiLo))
+aucPerf_nb2_nrc <-performance(pred_nrc_nb2, "tpr", "fpr")
+plot(aucPerf_nb2_nrc) + abline(a=0, b= 1)
+
+
+```
+
+#svm for nrc
+```{r}
+
+svmM1_nrc <- svm(as.factor(hiLo) ~., data = revDTM_senti_nrc_trn %>%select(-review_id),kernel="radial", scale=FALSE)
+
+#prediction
+revDTM_predTrn_svm1_nrc<-predict(svmM1_nrc, revDTM_senti_nrc_trn)
+mean(revDTM_predTrn_svm1_nrc == revDTM_senti_nrc_trn$hiLo)
+table(actual= revDTM_senti_nrc_trn$hiLo, predicted= revDTM_predTrn_svm1_nrc)
+
+#Test prediction
+revDTM_predTst_svm1_nrc<-predict(svmM1_nrc, revDTM_senti_nrc_tst)
+mean(revDTM_predTst_svm1_nrc == revDTM_senti_nrc_tst$hiLo)
+table(actual= revDTM_senti_nrc_tst$hiLo, predicted= revDTM_predTst_svm1_nrc)
+
+#auc train
+auc(as.numeric(revDTM_senti_nrc_trn$hiLo), as.numeric(revDTM_predTrn_svm1_nrc))
+auc(as.numeric(revDTM_senti_nrc_tst$hiLo), as.numeric(revDTM_predTst_svm1_nrc))
+
+```
+#RAndom Forest- AFINN Dictionary
+
+```{r}
+#Getting a datamatrix
+revDTM_senti_affin <- rrSenti_afinn %>%  pivot_wider(id_cols = c(review_id,stars), names_from = word, values_from = tf_idf)  %>% ungroup()
+
+#filter out the reviews with stars=3, and calculate hiLo sentiment 'class'
+revDTM_senti_affin<- revDTM_senti_affin %>% filter(stars!=3) %>% mutate(hiLo=ifelse(stars<=2, -1, 1)) %>% select(-stars)
+
+#how many review with 1, -1  'class'
+revDTM_senti_affin %>% group_by(hiLo) %>% tally()
+
+#develop a random forest model to predict hiLo from the words in the reviews
+#replace all the NAs with 0
+revDTM_senti_affin<-revDTM_senti_affin %>% replace(., is.na(.), 0)
+
+revDTM_sentiAffin_split<- initial_split(revDTM_senti_affin, 0.5)
+revDTM_sentiAffin_trn<- training(revDTM_sentiAffin_split)
+revDTM_sentiAffin_tst<- testing(revDTM_sentiAffin_split)
+
+rfModel1_affin<-ranger(dependent.variable.name = "hiLo", data=revDTM_sentiAffin_trn %>% select(-review_id), num.trees = 500, importance='permutation', probability = TRUE)
+
+rfModel1_affin
+
+#Predict train 
+revSentiAffin_predTrn<- predict(rfModel1_affin, revDTM_sentiAffin_trn %>% select(-review_id))$predictions
+revSentiAffin_predTrn1<-revSentiAffin_predTrn[,2]
+revSentiAffin_predTrn2 <- ifelse(revSentiAffin_predTrn1>0.5,1,-1)
+mean(revSentiAffin_predTrn2 == revDTM_sentiAffin_trn$hiLo)
+
+revSentiAffin_predTst<- predict(rfModel1_affin, revDTM_sentiAffin_tst %>% select(-review_id))$predictions
+revSentiAffin_predTst1<-revSentiAffin_predTst[,2]
+revSentiAffin_predTst2 <- ifelse(revSentiAffin_predTst1>0.5,1,-1)
+mean(revSentiAffin_predTst2 == revDTM_sentiAffin_tst$hiLo)
+
+auc(as.numeric(revDTM_sentiAffin_trn$hiLo), revSentiAffin_predTrn[,2])
+auc(as.numeric(revDTM_sentiAffin_tst$hiLo), revSentiAffin_predTst[,2])
+table(actual=revDTM_sentiAffin_trn$hiLo, preds=revSentiAffin_predTrn[,2]>0.5)
+table(actual=revDTM_sentiAffin_tst$hiLo, preds=revSentiAffin_predTst[,2]>0.3)
+
+rocTrn <- roc(revDTM_sentiAffin_trn$hiLo, revSentiAffin_predTrn[,2], levels=c(-1, 1))
+rocTst <- roc(revDTM_sentiAffin_tst$hiLo, revSentiAffin_predTst[,2], levels=c(-1, 1))
+
+plot.roc(rocTrn, col='blue', legacy.axes = TRUE)
+plot.roc(rocTst, col='red', add=TRUE)
+legend("bottomright", legend=c("Training", "Test"),
+        col=c("blue", "red"), lwd=2, cex=0.8, bty='n')
+
+```
+
+#AFINN- Naive Bayes
+
+```{r}
+nbModel1_affin<-naiveBayes(hiLo ~ ., data=revDTM_sentiAffin_trn %>% select(-review_id))
+
+#prediction on train
+revSentiAffin_NBpredTrn<-predict(nbModel1_affin, revDTM_sentiAffin_trn, type = "raw")
+revSentiAffin_NBpredTrn1<-revSentiAffin_NBpredTrn[,2]
+revSentiAffin_NBpredTrn2 <- ifelse(revSentiAffin_NBpredTrn1>0.5,1,-1)
+mean(revSentiAffin_NBpredTrn2 == revDTM_sentiAffin_trn$hiLo)
+
+
+revSentiAffin_NBpredTst<-predict(nbModel1_affin, revDTM_sentiAffin_tst, type = "raw")
+revSentiAffin_NBpredTst1<-revSentiAffin_NBpredTst[,2]
+revSentiAffin_NBpredTst2 <- ifelse(revSentiAffin_NBpredTst1>0.5,1,-1)
+mean(revSentiAffin_NBpredTst2 == revDTM_sentiAffin_tst$hiLo)
+
+#auc train
+auc(as.numeric(revDTM_sentiAffin_trn$hiLo), revSentiAffin_NBpredTrn[,2])
+auc(as.numeric(revDTM_sentiAffin_tst$hiLo), revSentiAffin_NBpredTst[,2])
+
+table(actual=revDTM_sentiAffin_trn$hiLo, preds=revSentiAffin_NBpredTrn[,2]>0.5)
+table(actual=revDTM_sentiAffin_tst$hiLo, preds=revSentiAffin_NBpredTst[,2]>0.3)
+
+#ROC curve
+pred_affin_nb1=prediction(as.numeric(revSentiAffin_NBpredTst[,2]),as.numeric(revDTM_sentiAffin_tst$hiLo))
+aucPerf_nb1_affin <-performance(pred_affin_nb1, "tpr", "fpr")
+plot(aucPerf_nb1_affin) + abline(a=0, b= 1)
+```
+
+#SVM- AFFIN dictionary
+```{r}
+svmM1_affin <- svm(as.factor(hiLo) ~., data = revDTM_sentiAffin_trn %>%select(-review_id),kernel="radial", scale=FALSE)
+
+#predict- train
+revDTM_predTrn_svm1_affin<-predict(svmM1_affin, revDTM_sentiAffin_trn)
+mean(revDTM_predTrn_svm1_affin == revDTM_sentiAffin_trn$hiLo)
+table(actual= revDTM_sentiAffin_trn$hiLo, predicted= revDTM_predTrn_svm1_affin)
+
+#predict test
+revDTM_predTst_svm1_affin<-predict(svmM1_affin, revDTM_sentiAffin_tst)
+mean(revDTM_predTst_svm1_affin == revDTM_sentiAffin_tst$hiLo)
+table(actual= revDTM_sentiAffin_tst$hiLo, predicted= revDTM_predTst_svm1_affin)
+#AUC
+auc(as.numeric(revDTM_sentiAffin_trn$hiLo), as.numeric(revDTM_predTrn_svm1_affin))
+auc(as.numeric(revDTM_sentiAffin_tst$hiLo), as.numeric(revDTM_predTst_svm1_affin))
+```
+
+#Combining all the three dictionaries and creating the DCTM matrix
+```{r}
+
+rrSenti_bing1<- rrTokens %>% inner_join(get_sentiments("bing"), by="word")
+rrSenti_bing1 <- ungroup(rrSenti_bing1)
+rrSenti_bing1<-rrSenti_bing1%>% select(word)
+rrSenti_nrc1<-rrTokens %>% inner_join(get_sentiments("nrc"), by="word") 
+rrSenti_nrc1 <- ungroup(rrSenti_nrc1)
+rrSenti_nrc1<-rrSenti_nrc1%>% select(word)
+rrSenti_afinn1<- rrTokens %>% inner_join(get_sentiments("afinn"), by="word")
+rrSenti_afinn1 <- ungroup(rrSenti_afinn1)
+rrSenti_afinn1<-rrSenti_afinn1%>% select(word)
+Data_combined<-union(rrSenti_bing1,rrSenti_nrc1 )
+Data_combined1<-union(Data_combined,rrSenti_afinn1 )
+Data_combined1<-Data_combined1[!duplicated(Data_combined1), ]
+###########
+Data_combined2<-rrTokens %>% inner_join(Data_combined1, by="word")
+
+#creating a data matrix
+revDTM_senticombined <- Data_combined2 %>%  pivot_wider(id_cols = c(review_id,stars), names_from = word, values_from = tf_idf)  %>% ungroup()
+
+#filter out the reviews with stars=3, and calculate hiLo sentiment 'class'
+revDTM_senticombined  <- revDTM_senticombined  %>% filter(stars!=3) %>% mutate(hiLo=ifelse(stars<=2, -1, 1)) %>% select(-stars)
+
+#count of +1 and -1
+revDTM_senticombined  %>% group_by(hiLo) %>% tally()
+
+#replace all the NAs with 0
+revDTM_senticombined<-revDTM_senticombined %>% replace(., is.na(.), 0)
+
+```
+
+#Random Forests - Combines
+
+```{r}
+
+
+#spilt into training and testing 50-50 proportion
+revDTM_sentiComb_split<- initial_split(revDTM_senticombined, 0.5)
+revDTM_sentiComb_trn<- training(revDTM_sentiComb_split)
+revDTM_sentiComb_tst<- testing(revDTM_sentiComb_split)
+
+rfModel1_Comb<-ranger(dependent.variable.name = "hiLo", data=revDTM_sentiComb_trn %>% select(-review_id), num.trees = 500, importance='permutation', probability = TRUE)
+
+gc()
+#Details
+rfModel1_Comb
+
+#Predict train 
+revSentiComb_predTrn<- predict(rfModel1_Comb, revDTM_sentiComb_trn %>% select(-review_id))$predictions
+revSentiComb_predTrn1<-revSentiComb_predTrn[,2]
+revSentiComb_predTrn2 <- ifelse(revSentiComb_predTrn1>0.5,1,-1)
+mean(revSentiComb_predTrn2 == revDTM_sentiComb_trn$hiLo)
+
+#Predict Test
+revSentiComb_predTst<- predict(rfModel1_Comb, revDTM_sentiComb_tst %>% select(-review_id))$predictions
+revSentiComb_predTst1<-revSentiComb_predTst[,2]
+revSentiComb_predTst2 <- ifelse(revSentiComb_predTst1>0.5,1,-1)
+mean(revSentiComb_predTst2 == revDTM_sentiComb_tst$hiLo)
+
+auc(as.numeric(revDTM_sentiComb_trn$hiLo), revSentiComb_predTrn[,2])
+auc(as.numeric(revDTM_sentiComb_tst$hiLo), revSentiComb_predTst[,2])
+table(actual=revDTM_sentiComb_trn$hiLo, preds=revSentiComb_predTrn[,2]>0.5)
+table(actual=revDTM_sentiComb_tst$hiLo, preds=revSentiComb_predTst[,2]>0.5)
+
+rocTrn <- roc(revDTM_sentiComb_trn$hiLo, revSentiComb_predTrn[,2], levels=c(-1, 1))
+rocTst <- roc(revDTM_sentiComb_tst$hiLo, revSentiComb_predTst[,2], levels=c(-1, 1))
+
+plot.roc(rocTrn, col='blue', legacy.axes = TRUE)
+plot.roc(rocTst, col='red', add=TRUE)
+legend("bottomright", legend=c("Training", "Test"),
+        col=c("blue", "red"), lwd=2, cex=0.8, bty='n')
+
+```
+
+#Combined- Naive Bayaes
+
+```{r}
+
+
+nbModel1_Comb<-naiveBayes(hiLo ~ ., data=revDTM_sentiComb_trn %>% select(-review_id))
+
+#prediction on train
+revSentiComb_NBpredTrn<-predict(nbModel1_Comb, revDTM_sentiComb_trn, type = "raw")
+revSentiComb_NBpredTrn1<-revSentiComb_NBpredTrn[,2]
+revSentiComb_NBpredTrn2 <- ifelse(revSentiComb_NBpredTrn1>0.5,1,-1)
+mean(revSentiComb_NBpredTrn2 == revDTM_sentiComb_trn$hiLo)
+
+
+revSentiComb_NBpredTst<-predict(nbModel1_Comb, revDTM_sentiComb_tst, type = "raw")
+revSentiComb_NBpredTst1<-revSentiComb_NBpredTst[,2]
+revSentiComb_NBpredTst2 <- ifelse(revSentiComb_NBpredTst1>0.5,1,-1)
+mean(revSentiComb_NBpredTst2 == revDTM_sentiComb_tst$hiLo)
+
+#auc train
+auc(as.numeric(revDTM_sentiComb_trn$hiLo), revSentiComb_NBpredTrn[,2])
+auc(as.numeric(revDTM_sentiComb_tst$hiLo), revSentiComb_NBpredTst[,2])
+
+table(actual=revDTM_sentiComb_trn$hiLo, preds=revSentiComb_NBpredTrn[,2]>0.5)
+table(actual=revDTM_sentiComb_tst$hiLo, preds=revSentiComb_NBpredTst[,2]>0.3)
+
+#ROC curve
+pred_Comb_nb1=prediction(as.numeric(revSentiComb_NBpredTst[,2]),as.numeric(revDTM_sentiComb_tst$hiLo))
+aucPerf_nb1_Comb <-performance(pred_Comb_nb1, "tpr", "fpr")
+plot(aucPerf_nb1_Comb) + abline(a=0, b= 1)
+
+```
+
+#SVM- Combined
+
+```{r}
+svmM1_Comb <- svm(as.factor(hiLo) ~., data = revDTM_sentiComb_trn %>%select(-review_id),kernel="radial", gamma=0.1, cost=1, scale=FALSE)
+
+#predict- train
+revDTM_predTrn_svm1_Comb<-predict(svmM1_Comb, revDTM_sentiComb_trn)
+mean(revDTM_predTrn_svm1_Comb == revDTM_sentiComb_trn$hiLo)
+table(actual= revDTM_sentiComb_trn$hiLo, predicted= revDTM_predTrn_svm1_Comb)
+
+#predict test
+revDTM_predTst_svm1_Comb<-predict(svmM1_Comb, revDTM_sentiComb_tst)
+mean(revDTM_predTst_svm1_Comb == revDTM_sentiComb_tst$hiLo)
+table(actual= revDTM_sentiComb_tst$hiLo, predicted= revDTM_predTst_svm1_Comb)
+#AUC
+auc(as.numeric(revDTM_sentiComb_trn$hiLo), as.numeric(revDTM_predTrn_svm1_Comb))
+auc(as.numeric(revDTM_sentiComb_tst$hiLo), as.numeric(revDTM_predTst_svm1_Comb))
+```
+
+
+#broader set of terms (not just those matching a sentiment dictionary)
+```{r message=FALSE, cache=TRUE}
+
+#if we want to remove the words which are there in too many or too few of the reviews
+#First find out how many reviews each word occurs in
+rWords<-rrTokens %>% group_by(word) %>% summarise(nr=n()) %>% arrange(desc(nr))
+
+#How many words are there
+length(rWords$word)
+
+top_n(rWords, 20)
+top_n(rWords, -20)
+
+#Suppose we want to remove words which occur in > 90% of reviews, and those which are in, for example, less than 30 reviews
+reduced_rWords<-rWords %>% filter(nr< 6000 & nr > 30)
+length(reduced_rWords$word)
+
+#reduce the rrTokens data to keep only the reduced set of words
+reduced_rrTokens <- left_join(reduced_rWords, rrTokens)
+
+#Now convert it to a DTM, where each row is for a review (document), and columns are the terms (words)
+revDTM  <- reduced_rrTokens %>%  pivot_wider(id_cols = c(review_id,stars), names_from = word, values_from = tf_idf)  %>% ungroup()
+
+#Check
+dim(revDTM)
+  #do the numberof columsnmatch the words -- we should also have the stars column and the review_id
+
+#create the dependent variable hiLo of good/bad reviews absed on stars, and remove the review with stars=3
+revDTM <- revDTM %>% filter(stars!=3) %>% mutate(hiLo=ifelse(stars<=2, -1, 1)) %>% select(-stars)
+
+#replace NAs with 0s
+revDTM<-revDTM %>% replace(., is.na(.), 0)
+
+revDTM %>%   group_by(hiLo) %>% tally() %>% view()
+
+
+revDTM$hiLo<-as.factor(revDTM$hiLo)
+```
+
+#Random forest on broader set of variables
+
+```{r}
+revDTM_split<- initial_split(revDTM, 0.5)
+revDTM_trn<- training(revDTM_split)
+revDTM_tst<- testing(revDTM_split)
+
+#this can take some time...the importance ='permutation' takes time (we know why)
+rfModel2<-ranger(dependent.variable.name = "hiLo", data=revDTM_trn %>% select(-review_id), num.trees = 500, importance='permutation', probability = TRUE)
+
+rfModel2
+
+importance(rfModel2) %>% view()
+
+#Obtain predictions, and calculate performance
+rfModel1_predTrn<- predict(rfModel2, revDTM_trn %>% select(-review_id))$predictions
+rfModel1_predTst<- predict(rfModel2, revDTM_tst %>% select(-review_id))$predictions
+
+table(actual=revDTM_trn$hiLo, preds=rfModel1_predTrn[,2]>0.5)
+table(actual=revDTM_tst$hiLo, preds=rfModel1_predTst[,2]>0.5)
+
+
+rocTrn <- roc(revDTM_trn$hiLo, rfModel1_predTrn[,2], levels=c(-1, 1))
+rocTst <- roc(revDTM_tst$hiLo, rfModel1_predTst[,2], levels=c(-1, 1))
+plot.roc(rocTrn, col='blue')
+plot.roc(rocTst, col='red', add=TRUE)
+plot.roc(rocTst)
+legend("bottomright", legend=c("Training", "Test"),col=c("blue", "red"), lwd=2, cex=1, bty='n')
+
+auc(as.numeric(revDTM_trn$hiLo), rfModel1_predTrn[,2])
+auc(as.numeric(revDTM_tst$hiLo), rfModel1_predTst[,2])
+
+```
+
+
+# Broader set of variables SVM
+
+```{r}
+
+#develop a SVM model on the sentiment dictionary terms
+svmM1 <- svm(as.factor(hiLo) ~., data = revDTM_trn %>%select(-review_id), kernel="radial", cost=1, scale=FALSE)
+#scale is set to TRUE by default. Since all vars are in tfidf, we shud set scale=FALSE
+revDTM_predTrn_svm1<-predict(svmM1, revDTM_trn)
+revDTM_predTst_svm1<-predict(svmM1, revDTM_tst,decision.values = TRUE)
+table(actual= revDTM_trn$hiLo, predicted= revDTM_predTrn_svm1)
+table(actual= revDTM_tst$hiLo, predicted= revDTM_predTst_svm1)
+
+auc(as.numeric(revDTM_trn$hiLo), as.numeric(revDTM_predTrn_svm1))
+auc(as.numeric(revDTM_tst$hiLo), as.numeric(revDTM_predTst_svm1))
+
+
+#building ROC curve
+
+svm1_roc <- prediction(attributes(revDTM_predTst_svm1)$decision.values,revDTM_tst$hiLo)
+auc_svm1<-performance(svm1_roc,'tpr','fpr')
+plot(auc_svm1)+ abline(a=0, b= 1)
+
+# try different parameters -- rbf kernel gamma, and cost
+system.time( svmM2 <- svm(as.factor(hiLo) ~., data = revDTM_trn
+%>% select(-review_id), kernel="radial", cost=5, gamma=0.5, scale=FALSE) )
+revDTM_predTrn_svm2<-predict(svmM2, revDTM_trn)
+table(actual= revDTM_trn$hiLo, predicted= revDTM_predTrn_svm2)
+revDTM_predTst_svm2<-predict(svmM2, revDTM_tst,decision.values = TRUE)
+table(actual= revDTM_tst$hiLo, predicted= revDTM_predTst_svm2)
+
+auc(as.numeric(revDTM_trn$hiLo), as.numeric(revDTM_predTrn_svm2))
+auc(as.numeric(revDTM_tst$hiLo), as.numeric(revDTM_predTst_svm2))
+
+
+#building ROC curve
+
+svm2_roc <- prediction(attributes(revDTM_predTst_svm2)$decision.values,revDTM_tst$hiLo)
+auc_svm2<-performance(svm2_roc,'tpr','fpr')
+plot(auc_svm2)+ abline(a=0, b= 1)
+
+# try different parameters -- rbf kernel gamma, and cost
+system.time( svmM3 <- svm(as.factor(hiLo) ~., data = revDTM_trn
+%>% select(-review_id), kernel="radial", cost=1, gamma=0.1, scale=FALSE) )
+revDTM_predTrn_svm3<-predict(svmM3, revDTM_trn)
+table(actual= revDTM_trn$hiLo, predicted= revDTM_predTrn_svm3)
+revDTM_predTst_svm3<-predict(svmM3, revDTM_tst, decision.values = TRUE)
+table(actual= revDTM_tst$hiLo, predicted= revDTM_predTst_svm3)
+
+auc(as.numeric(revDTM_trn$hiLo), as.numeric(revDTM_predTrn_svm3))
+auc(as.numeric(revDTM_tst$hiLo), as.numeric(revDTM_predTst_svm3))
+
+#building ROC curve
+
+svm3_roc <- prediction(attributes(revDTM_predTst_svm3)$decision.values,revDTM_tst$hiLo)
+auc_svm3<-performance(svm3_roc,'tpr','fpr')
+plot(auc_svm3)+ abline(a=0, b= 1)
+
+
+```
+# Broader Set of variables naive bayes
+
+```{r}
+library(e1071)
+nbModel1<-naiveBayes(hiLo ~ ., data=revDTM_trn %>% select(-review_id))
+rev_NBpredTrn<-predict(nbModel1, revDTM_trn, type = "raw")
+rev_NBpredTst<-predict(nbModel1, revDTM_tst, type = "raw")
+
+
+#Confusion matrix
+table(actual=revDTM_trn$hiLo, preds=rev_NBpredTrn[,2]>0.5)
+table(actual=revDTM_tst$hiLo, preds=rev_NBpredTst[,2]>0.5)
+
+library(pROC)
+rocTrn <- roc(revDTM_trn$hiLo, rev_NBpredTrn[,2], levels=c(-1, 1))
+rocTst <- roc(revDTM_tst$hiLo, rev_NBpredTst[,2], levels=c(-1, 1))
+plot.roc(rocTrn, col='blue')
+plot.roc(rocTst, col='red', add=TRUE)
+legend("bottomright", legend=c("Training", "Test"),col=c("blue", "red"), lwd=2, cex=1, bty='n')
+
+auc(as.numeric(revDTM_trn$hiLo), rev_NBpredTrn[,2])
+auc(as.numeric(revDTM_tst$hiLo), rev_NBpredTst[,2])
+
+```
+
+```
+
+***END***
+
+
+
